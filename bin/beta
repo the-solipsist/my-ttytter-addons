@@ -24,7 +24,7 @@ BEGIN {
 	$command_line = $0; $0 = "TTYtter";
 	$TTYtter_VERSION = "1.2";
 	$TTYtter_PATCH_VERSION = 0;
-	$TTYtter_RC_NUMBER = 3; # non-zero for release candidate
+	$TTYtter_RC_NUMBER = 4; # non-zero for release candidate
 	# this is kludgy, yes.
 	$LANG = $ENV{'LANG'} || $ENV{'GDM_LANG'} || $ENV{'LC_CTYPE'} ||
 			$ENV{'ALL'};
@@ -327,6 +327,7 @@ $tweet_counter = 0;
 %dm_store_hash = ();
 $dm_counter = 0;
 %id_cache = ();
+%filter_next = ();
 
 # set up threading management
 $in_reply_to = 0;
@@ -3362,12 +3363,17 @@ sub refresh {
 
 		# we have to filter against the ID cache right now, because
 		# we might not have any other streams!
-		if ($fetch_id) {
+		if ($fetch_id && $last_id) {
 			$my_json_ref = [];
 			my $l;
+			my %k; # need temporary dedupe
 			foreach $l (@{ $base_json_ref }) {
-				push(@{ $my_json_ref }, $l)
-			unless (length($id_cache{$l->{'id_str'}}));
+				unless (length($id_cache{$l->{'id_str'}}) ||
+						$filter_next{$l->{'id_str'}} ||
+						$k{$l->{'id_str'}}) {
+					push(@{ $my_json_ref }, $l);
+					$k{$l->{'id_str'}}++;
+				}
 			}
 		} else {
 			$my_json_ref = $base_json_ref;
@@ -3442,8 +3448,11 @@ sub refresh {
 			SMIX0: foreach $j (@{ $n }) {
 				my $id = $j->{'id_str'}; # for ease of use
 
-				# filter this lot against the id cache.
+				# filter this lot against the id cache
+				# and any tweets we just filtered.
 				next SMIX0 if (length($id_cache{$id}) &&
+					$fetch_id);
+				next SMIX0 if ($filter_next{$id} &&
 					$fetch_id);
 
 				if (!$l) { # degenerate case
@@ -3475,6 +3484,7 @@ sub refresh {
 			}
 		}
 	}
+	%filter_next = ();
 
 	# fetch_id gyration. initially start with last_id, then roll. we
 	# want to keep a window, though, so we try to pick a sensible value
@@ -3483,7 +3493,9 @@ sub refresh {
 	$fetch_id = 0 if ($last_id == 0);
 	($last_id, $crap) =
 		&tdisplay($my_json_ref, undef, $relative_last_id);
-	my $new_fi = $my_json_ref->[(scalar(@{ $my_json_ref })-1)]->{'id_str'};
+	my $new_fi = (scalar(@{ $my_json_ref })) ?
+		$my_json_ref->[(scalar(@{ $my_json_ref })-1)]->{'id_str'} :
+		'';
 	# try to widen the window to a "reasonable amount"
 	$fetch_id = ($fetch_id == 0) ? $last_id :
 		(length($new_fi) && $new_fi ne $last_id) ? $new_fi :
@@ -3491,7 +3503,8 @@ sub refresh {
 			$relative_last_id : $fetch_id;
 	
 	print $stdout
-"-- last_id $last_id, fetch_id $fetch_id, rollback $relative_last_id\n"
+"-- last_id $last_id, fetch_id $fetch_id, rollback $relative_last_id\n".
+"-- (@{[ scalar(keys %id_cache) ]} cached)\n"
 		if ($verbose);
 	&send_removereadline if ($termrl);
 	&$conclude;
@@ -3532,10 +3545,11 @@ sub tdisplay { # used by both synchronous /again and asynchronous refreshes
 			$j = $my_json_ref->[$g];
 			my $id = $j->{'id_str'};
 
-			#next if ($id <= $last_id);
 			next if (!length($j->{'user'}->{'screen_name'}));
 			if ($filter_c && &$filter_c(&descape($j->{'text'}))) {
 				$filtered++;
+				$filter_next{$j->{'id_str'}}++
+					if ($is_background);
 				next;
 			}
 
@@ -5634,11 +5648,13 @@ sub is_fail_whale {
 sub is_json_error {
 	# is this actually a JSON error message? if so, extract it
 	my $data = shift;
-	if ($data =~ /(['"])(warning|error)\1\s*:\s*\1([^\1]*?)\1\}/s) {
+	if ($data =~ /(['"])(warning|errors?)\1\s*:\s*\1([^\1]*?)\1\}/s) {
 		my $probe = $3;
 		if ($data =~ /^\s*\{/s) { # JSON object?
 			my $dref = &parsejson($data);
 			return $dref->{'error'} if (length($dref->{'error'}));
+			return (split(/\\n/, $dref->{'errors'}))[0]
+				if(length($dref->{'errors'}));
 		}
 		return $probe;
 	}
