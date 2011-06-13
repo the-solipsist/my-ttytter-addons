@@ -20,11 +20,27 @@ BEGIN {
 	# THIS FUNCTION HAS GOTTEN TOO DAMN CLUTTERED!
 
 #	@INC = (); # wreck intentionally for testing
+
+	# this doesn't work for 5.14.0 (see Perl bug 92246)
+	if ($ENV{'PERL_SIGNALS'} ne 'unsafe' && $] >= 5.014) {
+		print STDOUT <<"EOF";
+TTYtter requires 'unsafe' Perl signals (which are of course for its
+purposes perfectly safe). unfortunately, due to Perl bug 92246 5.14+ cannot
+set this feature itself. set in your environment either of
+
+export PERL_SIGNALS=unsafe # sh, bash, ksh, etc.
+setenv PERL_SIGNALS unsafe # csh, tcsh, etc.
+
+and restart TTYtter, or use Perl 5.12 or earlier.
+EOF
+		exit;
+	}
 	$ENV{'PERL_SIGNALS'} = 'unsafe';
+	
 	$command_line = $0; $0 = "TTYtter";
 	$TTYtter_VERSION = "1.2";
 	$TTYtter_PATCH_VERSION = 0;
-	$TTYtter_RC_NUMBER = 4; # non-zero for release candidate
+	$TTYtter_RC_NUMBER = 5; # non-zero for release candidate
 	# this is kludgy, yes.
 	$LANG = $ENV{'LANG'} || $ENV{'GDM_LANG'} || $ENV{'LC_CTYPE'} ||
 			$ENV{'ALL'};
@@ -36,6 +52,7 @@ BEGIN {
 	# for multi-module extension handling
 	$multi_module_mode = 0;
 	$multi_module_context = 0;
+	$muffle_server_messages = 0;
 	undef $master_store;
 	undef %push_stack;
 
@@ -61,6 +78,7 @@ BEGIN {
 		modifyliurl adduliurl delliurl getliurl getlisurl getfliurl
 		getuliurl getufliurl dmsenturl rturl rtsbyurl
 		statusliurl followliurl leaveliurl followersurl
+		oauthurl oauthauthurl oauthaccurl oauthbase
 	); %opts_secret = map { $_ => 1} qw(
 		superverbose ttytteristas
 	); %opts_comma_delimit = map { $_ => 1 } qw(
@@ -90,14 +108,15 @@ BEGIN {
 		nonewrts synch runcommand authtype oauthkey oauthsecret
 		tokenkey tokensecret xauthurl credurl keyf readlinerepaint
 		oldstatus simplestart freezebug exception_is_maskable oldperl
-		notify_tool_path
+		notify_tool_path oauthurl oauthauthurl oauthaccurl oauthbase
 	); %valid = (%opts_can_set, %opts_others);
 	$rc = (defined($rc) && length($rc)) ? $rc : "";
 	unless ($norc) {
 		my $rcf =
 			($rc =~ m#^/#) ? $rc : "$ENV{'HOME'}/.ttytterrc${rc}";
 		if (open(W, $rcf)) {
-			eval 'binmode(W, ":utf8")';
+			# 5.14 sets this lazily, so this gives us a way out
+			eval 'binmode(W, ":utf8")' unless ($seven);
 			while(<W>) {
 				chomp;
 				next if (/^\s*$/ || /^#/);
@@ -159,14 +178,14 @@ EOF
 
 	# try to find an OAuth keyfile if we haven't specified key+secret
 	# no worries if this fails; we could be Basic Auth, after all
-	if (!length($oauthkey) && !length($oauthsecret)
+	$whine = (length($keyf)) ? 1 : 0;
+	$keyf ||= "$ENV{'HOME'}/.ttytterkey";
+	$keyf = "$ENV{'HOME'}/.ttytterkey${keyf}" if ($keyf !~ m#/#);
+	$attempted_keyf = $keyf;
+	if (!length($oauthkey) && !length($oauthsecret) # set later
 			&& !length($tokenkey)
-			&& !length($tokensecret)) {
+			&& !length($tokensecret) && !$oauthwizard) {
 		my $keybuf = '';
-		my $whine = (length($keyf)) ? 1 : 0;
-		$keyf ||= "$ENV{'HOME'}/.ttytterkey";
-		$keyf = "$ENV{'HOME'}/.ttytterkey${keyf}"
-			if ($keyf !~ m#/#);
 		if(open(W, $keyf)) {
 			while(<W>) {
 				chomp;
@@ -194,7 +213,9 @@ EOF
 					!length($tokenkey) ||
 					!length($tokensecret)));
 		} else {
-			die("** couldn't open keyfile $keyf: $!\n")
+			die("** couldn't open keyfile $keyf: $!\n".
+	"if you want to run the OAuth wizard to create this file, add ".
+				"-oauthwizard\n")
 				if ($whine);
 			$keyf = ''; # i.e., we loaded nothing from a key file
 		}
@@ -568,6 +589,8 @@ $lat ||= undef;
 $long ||= undef;
 $location ||= 0;
 $linelength ||= 140;
+$oauthbase ||= $apibase || "${http_proto}://api.twitter.com";
+# this needs to be AFTER oauthbase so that apibase can set oauthbase.
 $apibase ||= "${http_proto}://api.twitter.com/1";
 $nonewrts ||= 0;
 # special case: if we explicitly refuse backload, don't load initially.
@@ -579,7 +602,12 @@ $url ||= ($anonymous)
 	: ($nonewrts)
 	?  "${apibase}/statuses/friends_timeline.json"
 	: "${apibase}/statuses/home_timeline.json";
-$xauthurl ||= "${http_proto}://api.twitter.com/oauth/access_token";
+
+$oauthurl ||= "${oauthbase}/oauth/request_token";
+$oauthauthurl ||= "${oauthbase}/oauth/authorize";
+$oauthaccurl ||= "${oauthbase}/oauth/access_token";
+$xauthurl ||= $oauthaccurl;
+
 $credurl ||= "${apibase}/account/verify_credentials.json";
 $update ||= "${apibase}/statuses/update.json";
 $rurl ||= "${apibase}/statuses/mentions.json";
@@ -781,15 +809,16 @@ if ($lynx) {
 				my $nonce;
 				my $timestamp;
 				my $sig;
+				my $verifier = '';
 				my $header;
 				my $ttoken = (length($mytoken) ?
 					(' oauth_token=\\"'.$mytoken.'\\",') :
 						'');
 
-				($timestamp, $nonce, $sig) = &signrequest(
-					$resource, $data);
+				($timestamp, $nonce, $sig, $verifier) =
+					&signrequest($resource, $data);
 				$header = <<"EOF";
--H "Authorization: OAuth oauth_nonce=\\"$nonce\\", oauth_signature_method=\\"HMAC-SHA1\\", oauth_timestamp=\\"$timestamp\\", oauth_consumer_key=\\"$oauthkey\\", oauth_signature=\\"$sig\\",$ttoken oauth_version=\\"1.0\\""
+-H "Authorization: OAuth oauth_nonce=\\"$nonce\\", oauth_signature_method=\\"HMAC-SHA1\\", oauth_timestamp=\\"$timestamp\\", oauth_consumer_key=\\"$oauthkey\\", oauth_signature=\\"$sig\\",${ttoken}${verifier} oauth_version=\\"1.0\\""
 EOF
 				print $stdout $header if ($superverbose);
 				$l .= $header;
@@ -828,6 +857,16 @@ if ($authtype eq 'oauth' && length($user)) {
 }
 $whoami = (split(/\:/, $user, 2))[0] unless ($anonymous || !length($user));
 
+# yes, this is plaintext. obfuscation would be ludicrously easy to crack,
+# and there is no way to hide them effectively or fully in a Perl script.
+# so be a good neighbour and leave this the fark alone, okay? stealing
+# credentials is mean and inconvenient to users. this is blessed by
+# arrangement with Twitter. don't be a d*ck. thanks for your cooperation.
+$oauthkey = (!length($oauthkey) || $oauthkey eq 'X') ?
+	"XtbRXaQpPdfssFwdUmeYw" : $oauthkey;
+$oauthsecret = (!length($oauthsecret) || $oauthsecret eq 'X') ?
+	"csmjfTQPE8ZZ5wWuzgPJPOBR9dyvOBEtHT5cJeVVmAA" : $oauthsecret;
+
 unless ($anonymous) {
 # if we are using Basic Auth or xAuth, ignore any user token we may have in
 # our keyfile
@@ -835,12 +874,12 @@ if ($authtype eq 'basic' || $authtype eq 'xauth') {
 	$tokenkey = undef;
 	$tokensecret = undef;
 }
-# but if we are using OAuth, and we have no tokens or app key/secret, stop now
-elsif ($authtype eq 'oauth' && !length($keyf)) { # bad keyfiles caught early
-	if (!length($oauthkey) &&
-			!length($oauthsecret) &&
-			!length($tokenkey) &&
-			!length($tokensecret)) {
+# but if we are using OAuth, we can request one, unless we are in script
+elsif ($authtype eq 'oauth' && (!length($keyf) || $oauthwizard)) {
+	if (length($oauthkey) && length($oauthsecret) && 
+			!length($tokenkey) && !length($tokensecret)) {
+		# we have a key, we don't have the user token
+		# but we can't get that with -script
 		if ($script) {
 			print $streamout <<"EOF";
 AUTHENTICATION FAILURE
@@ -849,106 +888,271 @@ YOU NEED TO GET AN OAuth KEY, or use -authtype=basic
 EOF
 			exit;
 		}
-		# friendly installer
-		if (!length($ENV{'HOME'})) {
-			print $streamout <<"EOF";
-Can't run the OAuth keyfile assistant without the HOME environment variable!
-(is this a cron job gone bad? if so, try using -keyf=...)
-EOF
-			exit;
-		}
-		$keyf = "$ENV{'HOME'}/.ttytterkey";
-		print $stdout <<'EOF';
+		# run the wizard, which writes a keyfile for us
+		$keyf ||= $attempted_keyf;
+		print $stdout <<"EOF";
 
-++-------------------------------------------------------------------++
-||  WELCOME TO TTYtter: let's get you set up with an OAuth keyfile!  ||
-++-------------------------------------------------------------------++
-Twitter now requires all applications authenticating to it use OAuth, a
-more complex authentication system that uses tokens and keys instead of
-screen names and passwords. To use TTYtter with this Twitter account, 
-you will need your own app key and access token. This requires a browser.
++----------------------------------------------------------------------------+
+|| WELCOME TO TTYtter: Authorize TTYtter by signing into Twitter with OAuth ||
++----------------------------------------------------------------------------+
+Looks like you're starting TTYtter for the first time, and/or creating a
+keyfile. Welcome to the most user-hostile, highly obfuscated, spaghetti code
+infested and obscenely obscure Twitter client that's out there. You'll love it.
 
-The app key/secret and user access token/secret go into a keyfile and
-act as your credentials; instead of using -user, you use -keyf. THIS
-KEYFILE NEVER EXPIRES. YOU ONLY NEED TO DO THIS ONCE FOR EACH ACCOUNT.
+TTYtter generates a keyfile that contains credentials for you, including your
+access tokens. This needs to be done JUST ONCE. You can take this keyfile with
+you to other systems. If you revoke TTYtter's access, you must remove the
+keyfile and start again with a new token. You need to do this once per account
+you use with TTYtter; only one account token can be stored per keyfile. If you
+have multiple accounts, use -keyf=... to specify different keyfiles. KEEP THESE
+FILES SECRET.
 
-If you DON'T want to use OAuth with TTYtter, PRESS CTRL-C now. Restart
-TTYtter with -authtype=basic to use a username and password. THIS IS
-WHAT YOU WANT FOR STATUSNET, BUT WILL NOT WORK WITH TWITTER!
-If you need help with this, talk to @ttytter or E-mail ckaiser@floodgap.com.
-EOF
-
-print <<"EOF";
-
-Otherwise, this wizard will create a keyfile $keyf
-for you. Press ENTER/RETURN to begin the process.
+** This wizard will overwrite $keyf
+Press RETURN/ENTER to continue or CTRL-C NOW! to abort.
 EOF
 		$j = <STDIN>;
+		print $stdout "\nRequest from $oauthurl ...";
+		($tokenkey, $tokensecret) = &tryhardfortoken($oauthurl,
+			"oauth_callback=oob");
+		$mytoken = $tokenkey;
+		$mytokensecret = $tokensecret; # needs to be in both places
+		# kludge in case user does not specify SSL and this is
+		# Twitter: we know Twitter supports SSL
+		($oauthauthurl =~ /twitter/) &&
+			($oauthauthurl =~ s/^http:/https:/);
 		print $stdout <<"EOF";
 
-Start your browser.
-1. Log in to https://twitter.com/ with your desired account.
-2. Go to this URL (all one line). You must be logged into Twitter FIRST!
+1. Visit, in your browser, ALL ON ONE LINE,
 
-http://dev.twitter.com/apps/key_exchange?oauth_consumer_key=XtbRXaQpPdfssFwdUmeYw
+${oauthauthurl}?oauth_token=$mytoken
 
-3. Twitter will confirm. Click Authorize, and accept the terms of service.
+2. If you are not already signed in, fill in your username and password.
+
+3. Verify that TTYtter is the requesting application, and that its permissions
+are as you expect (read your timeline, see who you follow and follow new
+people, update your profile, post tweets on your behalf and access your
+direct messages). IF THIS IS NOT CORRECT, PRESS CTRL-C NOW!
+
+4. Click Authorize app.
+
+5. A PIN number will appear. Enter it below.
+
 EOF
-		if (-e $keyf || !open(W, ">$keyf")) {
-			print $stdout <<"EOF";
-4. Copy the entire string you get back into a file (by default ~/.ttytterkey).
-   (For multiple key files for multiple accounts, use a different filename
-    and tell TTYtter where the key is using -keyf=... .)
-
-Then restart TTYtter with your changes.
-EOF
-			exit;
+		$j = '';
+		while(!(0+$j)) {
+			print $stdout "Enter PIN number> ";
+			chomp($j = <STDIN>);
 		}
-		print $stdout <<"EOF";
-4. Copy the entire string you get back.
--- Paste it into this terminal, then hit ENTER and CTRL-D to write it ---------
+		print $stdout "\nRequest from $oauthaccurl ...";
+		($tokenkey, $tokensecret) = &tryhardfortoken($oauthaccurl,
+			"oauth_verifier=$j");
+
+		$oauthkey = "X";
+		$oauthsecret = "X";
+		open(W, ">$keyf") ||
+			die("Failed to write keyfile $keyf: $!\n");
+		print W <<"EOF";
+ck=${oauthkey}&cs=${oauthsecret}&at=${tokenkey}&ats=${tokensecret}
 EOF
-		while(<STDIN>) {
-			print W $_;
-		}
 		close(W);
+		chmod(0600, $keyf) || print $stdout
+		"Warning: could not change permissions on $keyf : $!\n";
 		print $stdout <<"EOF";
--- EOF ------------------------------------------------------------------------
-Written new key file $keyf
-Now, restart TTYtter to use this keyfile -- it will use this one by default.
-(For multiple key files with multiple accounts, manually write them to other
- filenames, and tell TTYtter where the key is using -keyf=... . You can just
- use a text editor for that.)
+Written keyfile $keyf
+
+Now, restart TTYtter to use this keyfile.
+(To choose between multiple keyfiles other than the default .ttytterkey,
+ tell TTYtter where the key is using -keyf=... .)
 
 EOF
-		chmod(0600, $keyf) ||
-			print $stdout
-"Warning: could not change permissions on $keyf : $@\n";
 		exit;
-	} 
-	my $error = undef;
-	my $k;
-	foreach $k (qw(oauthkey oauthsecret tokenkey tokensecret)) {
-		$error .= "** you need to specify -$k\n"
-			if (!length($$k));
 	}
-	if (length($error)) {
-		print $stdout <<"EOF";
+	# if we get three of the four, this must have been command line
+	if (length($oauthkey) && length($oauthsecret) && 
+			(!length($tokenkey) || !length($tokensecret))) {
+		my $error = undef;
+		my $k;
+		foreach $k (qw(oauthkey oauthsecret tokenkey tokensecret)) {
+			$error .= "** you need to specify -$k\n"
+				if (!length($$k));
+		}
+		if (length($error)) {
+			print $streamout <<"EOF";
 
 you are missing portions of the OAuth sequence. either create a keyfile
 and point to it with -keyf=... or add these missing pieces:
 $error
 then restart TTYtter, or use -authtype=basic, or =xauth for supported keys.
 EOF
-		exit;
+			exit;
+		}
 	}
+} elsif ($retoke && length($keyf)) {
+	# start the "re-toke" wizard to convert DM-less cloned app keys.
+	# dup STDIN for systems that can only "close" it once
+	open(STDIN2, "<&STDIN") || die("couldn't dup STDIN: $!\n");
+	print $stdout <<"EOF";
+
++-------------------------------------------------------------------------+
+|| The Re-Toke Wizard: Generate a new TTYtter keyfile for your app/token ||
++-------------------------------------------------------------------------+
+Twitter is requiring tokens to now have specific permissions to READ
+direct messages. This will be enforced by 1 July 2011. If you find you are
+unable to READ direct messages, you will need this wizard. DO NOT use this
+wizard if you are NOT using a cloned app key (1.2 and on) -- use -oauthwizard.
+
+This wizard will create a new keyfile for you from your app/user keys/tokens.
+You do NOT need this wizard if you are using TTYtter for a purpose that does
+not require direct message access. For example, if TTYtter is acting as
+your command line posting agent, or you are only using it to read your
+timeline, you do NOT need a new token. You also do not need a new token to
+SEND a direct message, only to READ ones this account has received.
+
+You SHOULD NOT need this wizard if your app key was cloned after 1 June 2011.
+However, you can still use it if you experience this specific issue with DMs,
+or need to rebuild your keyfile for any other reason.
+
+** This wizard will overwrite the key at $keyf
+** To change this, restart TTYtter with -retoke -keyf=/path/to/keyfile
+Press RETURN/ENTER to continue, or CTRL-C NOW! to abort.
+EOF
+
+	$j = <STDIN>;
+	print $stdout <<"EOF";
+
+First: let's get your API key, consumer key and consumer secret.
+Start your browser.
+1. Log into https://twitter.com/ with your desired account.
+2. Go to this URL. You must be logged into Twitter FIRST!
+
+https://dev.twitter.com/apps
+
+3. Click the TTYtter cloned app key you need to regenerate or upgrade.
+4. Click Edit Application Settings.
+5. Make sure Read, Write & Private Message is selected, and click the
+   "Save application" button.
+6. Select All (CTRL/Command-A) on the next screen, copy (CTRL/Command-C) it,
+   and paste (CTRL/Command-V) it into this window. (You can also cut and
+   paste a smaller section if I can't understand your browser's layout.)
+7. Press ENTER/RETURN and CTRL-D when you have pasted the window contents.
+EOF
+
+	$q = $/;
+	PASTE1LOOP: for(;;) {
+		print $stdout <<"EOF";
+
+-- Press ENTER and CTRL-D AFTER you have pasted the window contents! ---------
+Go ahead:
+EOF
+		undef $/;
+		$j = <STDIN2>;
+		print $stdout <<"EOF";
+
+-- EOF -----------------------------------------------------------------------
+Processing ...
+
+EOF
+		$j =~ s/[\r\n]/ /sg;
+
+		# process this. as a checksum, API key should == consumer key.
+		$ak = '';
+		$ck = '';
+		$cs = '';
+		($j =~ /API key\s+([-a-zA-Z0-9_]{10,})\s+/) && ($ak = $1);
+		($j =~ /Consumer key\s+([-a-zA-Z0-9_]{10,})\s+/) && ($ck = $1);
+		($j =~ /Consumer secret\s+([-a-zA-Z0-9_]{10,})\s+/) &&
+			($cs = $1);
+
+		if (!length($ak) || !length($ck) || !length($cs)) {
+			# escape hatch
+			print $stdout <<"EOF";
+Something's wrong: I could not find your API key, consumer key or consumer
+secret in that text. If this was a misfired paste, please restart the wizard.
+Otherwise, bug me at \@ttytter or ckaiser\@floodgap.com. Please don't send
+keys or secrets to either address.
+
+EOF
+			exit;
+		}
+		if ($ak ne $ck) {
+			print $stdout <<"EOF";
+Your API key "$ak" doesn't match your consumer key "$ck".
+Please try again, or just hit CTRL-C to cancel if you're stuck.
+EOF
+			next PASTE1LOOP;
+		}
+		last PASTE1LOOP;
+	}
+	# this part is similar to the retoke.
+	$oauthkey = $ck;
+	$oauthsecret = $cs;
+	print $stdout "\nI'm testing this key to see if it works.\n";
+	print $stdout "Request from $oauthurl ...";
+	($tokenkey, $tokensecret) = &tryhardfortoken($oauthurl,
+		"oauth_callback=oob");
+	$mytoken = $tokenkey;
+	$mytokensecret = $tokensecret;
+	# kludge in case user does not specify SSL and this is
+	# Twitter: we know Twitter supports SSL
+	($oauthauthurl =~ /twitter/) && ($oauthauthurl =~ s/^http:/https:/);
+	$/ = $q;
+	print $stdout <<"EOF";
+
+Okay, your consumer key is ==> $ck
+ and your consumer secret  ==> $cs
+
+IF THIS IS WRONG, PRESS CTRL-C NOW AND RESTART THE WIZARD!
+
+Now we will verify your Imperial battle station is fully operational by
+signing in with OAuth.
+
+1. Visit, in your browser, ALL ON ONE LINE (you should still be logged in),
+
+${oauthauthurl}?oauth_token=$mytoken
+
+2. Verify that your app is the requesting application, and that its permissions
+are as you expect (read your timeline, see who you follow and follow new
+people, update your profile, post tweets on your behalf and access your
+direct messages). IF THIS IS NOT CORRECT, PRESS CTRL-C NOW!
+
+3. Click Authorize app.
+
+4. A PIN number will appear. Enter it below.
+
+EOF
+	print $stdout "Enter PIN number> ";
+	chomp($j = <STDIN>);
+	print $stdout "\nRequest from $oauthaccurl ...";
+	($at, $ats) = &tryhardfortoken($oauthaccurl, "oauth_verifier=$j");
+
+	print $stdout <<"EOF";
+
+Consumer key =========> $ck
+Consumer secret ======> $cs
+Access token =========> $at
+Access token secret ==> $ats
+
+EOF
+	open(W, ">$keyf") || (print $stdout ("Unable to write to $keyf: $!\n"),
+			exit);
+	print W "ck=$ck&cs=$cs&at=$at&ats=$ats\n";
+	close(W);
+	chmod(0600, $keyf) || print $stdout
+"Warning: could not change permissions on $keyf : $!\n";
+	print $stdout "Keys written to regenerated keyfile $keyf\n";
+	print $stdout "Now restart TTYtter.\n";	
+	exit;
 }
 
-# now, get a token (either from Basic Auth, the keyfile, or xAuth)
+# now, get a token (either from Basic Auth, the keyfile, OAuth, or xAuth)
 ($mytoken, $mytokensecret) = &authtoken;
 } # unless anonymous
 
 # initial login tests and command line controls
+if ($statusurl) {
+	$shorstatusturl = &urlshorten($statusurl);
+	$status .= ' ' . $shorstatusturl;
+}
 $phase = 0;
 $didhold = $hold;
 $hold = -1 if ($hold == 1 && !$script);
@@ -1460,8 +1664,9 @@ print $stdout "*** invalid UTF-8: partial delete of a wide character?\n";
 	}
 	if (m#^/sh(ort)? (https?|gopher)(://[^ ]+)#) {
 		my $url = $2 . $3;
-		print $stdout
-"*** shortened to: @{[ (&urlshorten($url) || 'FAILED -- %% to retry') ]}\n";
+		my $answer = (&urlshorten($url) || 'FAILED -- %% to retry');
+		print $stdout "*** shortened to: ";
+		print $streamout ($answer . "\n");
 		return 0;
 	}
 
@@ -2045,9 +2250,10 @@ EOF
 		}
 		my $g = &grabjson(
 			"${frurl}?user_a=${user_a}&user_b=${user_b}", 0);
-		print $stdout
-		"--- does $user_a follow ${user_b}? => $g->{'literal'}\n"
-			if ($g->{'ok'});
+		if ($g->{'ok'}) {
+			print $stdout "--- does $user_a follow ${user_b}? => ";
+			print $streamout "$g->{'literal'}\n"
+		}
 		return 0;
 	}
 
@@ -2060,6 +2266,7 @@ EOF
 		my $user = '';
 		my $what = '';
 		$arg =~ s/^@//;
+		$who = $arg;
 		($who, $lname) = split(m#/#, $arg, 2) if (m#/#);
 		if (length($lname) && !length($user) && $anonymous) {
 			print $stdout
@@ -3398,19 +3605,46 @@ sub refresh {
 	# failure here does not abort, because search may be down independently
 	# of the main timeline.
 	if (!$notrack && scalar(@trackstrings)) {
+		my $r;
+		my $k;
 		my $l = &max((($last_id) ? 100 :
 			$fetchwanted || $backload), $searchhits);
+		# temporarily squelch server complaints (see below)
+		$muffle_server_messages = 1;
 		foreach $k (@trackstrings) {
-		my $r = &grabjson("$queryurl?${k}&rpp=${l}&result_type=recent",
+		$r = &grabjson("$queryurl?${k}&rpp=${l}&result_type=recent",
 				$fetch_id, 1, 0, {
 					"type" => "search",
 					"payload" => $k
 				});
+		# depending on the state of the search API, we might be using
+		# a bogus search ID that is too far back. so if this fails,
+		# try again with last_id.
+			if (!defined($r) || ref($r) ne 'ARRAY') {
+		print $stdout "-- search retry $k attempted with last_id\n"
+				if ($verbose);
+		$r = &grabjson("$queryurl?${k}&rpp=${l}&result_type=recent",
+				$last_id, 1, 0, {
+					"type" => "search",
+					"payload" => $k
+				});
+			}
+		# or maybe not even then?
+			if (!defined($r) || ref($r) ne 'ARRAY') {
+		print $stdout "-- search retry $k attempted with zero!\n"
+				if ($verbose);
+		$r = &grabjson("$queryurl?${k}&rpp=${l}&result_type=recent",
+				0, 1, 0, {
+					"type" => "search",
+					"payload" => $k
+				});
+			}
 			push(@streams, $r)
 				if (defined($r) &&
 					ref($r) eq 'ARRAY' &&
 					scalar(@{ $r }));
 		}
+		$muffle_server_messages = 0;
 	}
 
 	# add stream for lists we have on with /set lists, and tag it with
@@ -3993,7 +4227,7 @@ sub standardtweet {
 	# twitter doesn't always do this right.
 	$h = $ref->{'retweet_count'}; $h += 0; $h = "${h}+" if ($h >= 100);
 	# twitter doesn't always handle single retweets right. good f'n grief.
-	$tweet = "(x${h}) $tweet" if ($h > 1);
+	$tweet = "(x${h}) $tweet" if ($h > 1 && !$nonewrts);
 	# br3nda's modified timestamp patch
 	if ($timestamp) {
 		my ($time, $ts) = &$wraptime($ref->{'created_at'});
@@ -4258,7 +4492,8 @@ sub flag_default_call { $this_call_default++; $did_call_default++; }
 
 sub defaultexception {
 	(&flag_default_call, return) if ($multi_module_context);
-	shift;
+	my $msg_code = shift;
+	return if ($msg_code == 2 && $muffle_server_messages);
 	my $message = "@_";
 	$message =~ s/\n*$//sg;
 	if ($timestamp) {
@@ -4439,7 +4674,7 @@ sub defaultautocompletion {
 			'/lleave', '/listfollowers', '/listfriends',
 			'/unset', '/verbose', '/short', '/follow', '/unfollow',
 			'/doesfollow', '/search', '/tron', '/troff',
-			'/delete', '/deletelast', '/dump', '/unset',
+			'/delete', '/deletelast', '/dump',
 			'/track', '/trends', '/block', '/unblock',
 			'/fave', '/faves', '/unfave', '/eval');
 	}
@@ -6049,7 +6284,8 @@ print $stdout " FINAL HASH \n" if ($showwork);
 	return $i;
 }
 
-# simple encoder for OAuth modified URL encoding
+# simple encoder for OAuth modified URL encoding (used for lots of things,
+# actually)
 # this is NOT UTF-8 safe
 sub url_oauth_sub {
 	my $x = shift;
@@ -6085,6 +6321,7 @@ sub defaultgetpassword {
 # this returns an immutable token corresponding to the current authenticated
 # session. in the case of Basic Auth, it is simply the user:password pair.
 # in the case of xAuth, it executes a fetch for the token and token secret.
+# it does not handle OAuth -- that is run by a separate wizard.
 # the function then returns (token,secret) which for Basic Auth is token,undef.
 #
 # most of the time we will be using tokens in a keyfile, however, so this
@@ -6107,6 +6344,12 @@ sub authtoken {
 	$pass = length($foo[1]) ? $foo[1] : &$getpassword;
 	die("a password must be specified.\n") if (!length($pass));
 	return ($whoami, $pass) if ($authtype eq 'basic');
+
+	print $stdout <<"EOF";
+>> WARNING: xAuth is now deprecated in TTYtter 1.2, and will be gone in 2.0
+>> if this is an issue for your application, notify ckaiser\@floodgap.com
+
+EOF
 
 	print $stdout "negotiating xAuth token ...";
 
@@ -6186,8 +6429,10 @@ sub signrequest {
 		# split into _a and _b payloads lexically
 		my $payload_a = '';
 		my $payload_b = '';
+		my $payload_c = ''; # this is for a special case
 		my $w;
 		my $aorb = 0;
+		my $verifier = '';
 		my $method = "GET";
 		my $url;
 	
@@ -6209,14 +6454,24 @@ sub signrequest {
 		}
 
 		# this is pretty simplistic but it's really all we need.
-		foreach $w (split(/\&/, $payload)) {
-			$aorb = 1 if ($w =~ /^[p-z]/ || $w =~ /^o[b-z]/);
-			$w = &url_oauth_sub("${w}&");
-			if ($aorb) {
-				$payload_b .= $w;
-			} else {
-				$payload_a .= $w;
+		# the exception is oauth_verifier: that has to be wormed
+		# into the middle, and we assume it's just that.
+		if ($payload !~ /^oauth_verifier/) {
+			foreach $w (split(/\&/, $payload)) {
+				$aorb = 1 if
+					($w =~ /^[p-z]/ || $w =~ /^o[b-z]/);
+				$w = &url_oauth_sub("${w}&");
+				if ($aorb) {
+					$payload_b .= $w;
+				} else {
+					$payload_a .= $w;
+				}
 			}
+		} else {
+			$payload_c = &url_oauth_sub($payload) . "%26";
+			$payload_a = $payload_b = '';
+			$payload =~ s/^oauth_verifier=//;
+			$verifier = ' oauth_verifier=\\"' . $payload . '\\",';
 		}
 		$payload_b =~ s/%26$//;
 		$sig_base = $method . "&" .
@@ -6228,6 +6483,7 @@ sub signrequest {
 			"oauth_timestamp%3D" . $timestamp . "%26" .
 			(length($mytoken) ? 
 				("oauth_token%3D" . $mytoken . "%26") : '') .
+			$payload_c .
 			"oauth_version%3D1.0" .
 			(length($payload_b) ? ("%26" . $payload_b) : '');
 	} else {
@@ -6239,12 +6495,57 @@ sub signrequest {
 			"oauth_timestamp%3D" . $timestamp . "%26" .
 			(length($mytoken) ? 
 				("oauth_token%3D" . $mytoken . "%26") : '') .
+			$payload_c . # could be part of it
 			"oauth_version%3D1.0" ;
 	}
 	print $stdout
 "token-secret: $mytokensecret\nconsumer-secret: $oauthsecret\nsig-base: $sig_base\n"
 		if ($superverbose);
 	return ($timestamp, $nonce,
-		&url_oauth_sub(&hmac_sha1($sig_base, @keybytes)));
+		&url_oauth_sub(&hmac_sha1($sig_base, @keybytes)),
+			$verifier);
 }
 
+# this takes a token request and "tries hard" to get it. this is descended
+# from the xAuth flow, but works for any generic token. please note: xAuth
+# is now deprecated as of 1.2.
+sub tryhardfortoken {
+	my $url = shift;
+	my $body = shift;
+	my $tries = shift;
+	my $rawtoken;
+	$tries ||= 3;
+
+	while($tries) {
+		my $i;
+		$rawtoken = &backticks($baseagent, '/dev/null', undef,
+			$url, $body, 0, @wend);
+		print $stdout ("token = $rawtoken\n")
+			if ($superverbose);
+		my (@keyarr) = split(/\&/, $rawtoken);
+		my $got_token = '';
+		my $got_secret = '';
+		foreach $i (@keyarr) {
+			my $key;
+			my $value;
+
+			($key, $value) = split(/\=/, $i);
+			$got_token = $value if ($key eq 'oauth_token');
+			$got_secret = $value if ($key eq 'oauth_token_secret');
+		}
+		if (length($got_token) && length($got_secret)) {
+			print $stdout " SUCCEEDED!\n";
+			return ($got_token, $got_secret);
+		}
+		print $stdout ".";
+		$tries--;
+	}
+	print $stdout " FAILED!: \"$rawtoken\"\n";
+die("unable to fetch token. here are some possible reasons:\n".
+    " - root certificates are not updated (see documentation)\n".
+    " - you entered your authentication information wrong\n".
+    " - your computer's clock is not set correctly\n" .
+    " - Twitter farted\n" .
+    "fix these possible problems, or try again later.\n");
+		exit;
+}
