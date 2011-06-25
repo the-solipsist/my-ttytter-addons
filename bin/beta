@@ -40,7 +40,7 @@ EOF
 	$command_line = $0; $0 = "TTYtter";
 	$TTYtter_VERSION = "1.2";
 	$TTYtter_PATCH_VERSION = 0;
-	$TTYtter_RC_NUMBER = 5; # non-zero for release candidate
+	$TTYtter_RC_NUMBER = 0; # non-zero for release candidate
 	# this is kludgy, yes.
 	$LANG = $ENV{'LANG'} || $ENV{'GDM_LANG'} || $ENV{'LC_CTYPE'} ||
 			$ENV{'ALL'};
@@ -1151,7 +1151,7 @@ EOF
 # initial login tests and command line controls
 if ($statusurl) {
 	$shorstatusturl = &urlshorten($statusurl);
-	$status .= ' ' . $shorstatusturl;
+	$status = ((length($status)) ? "$status " : "") . $shorstatusturl;
 }
 $phase = 0;
 $didhold = $hold;
@@ -1500,10 +1500,10 @@ print $stdout "*** invalid UTF-8: partial delete of a wide character?\n";
 	if (!$slowpost && !$verify && # we assume you know what you're doing!
 		($_ eq 'h' || $_ eq 'help' || $_ eq 'quit' || $_ eq 'q' ||
 			/^TTYtter>/ || $_ eq 'ls' || $_ eq '?' ||
-			$_ eq 'exit')) {
+			m#^help /# || $_ eq 'exit')) {
 		
 		&add_history($_);
-		unless ($_ eq 'exit' || /^TTYtter>/) {
+		unless ($_ eq 'exit' || /^TTYtter>/ || $_ eq 'ls') {
 			print $stdout "*** did you mean /$_ ?\n";
 			print $stdout
 				"*** to send this as a command, type /%%\n";
@@ -3326,7 +3326,7 @@ RESTART_SELECT:
 			$space_pad), 0, 1024);
 			print P $key;
 			goto RESTART_SELECT;
-		} elsif ($rout =~ /^kin ([^\s]+) /) {
+		} elsif ($rout =~ /^ki ([^\s]+) /) {
 			my $key = $1;
 			my $module;
 			sysread(STDIN, $module, 1024);
@@ -3338,7 +3338,7 @@ RESTART_SELECT:
 				$master_store->{$module}->{$key}).$space_pad,
 					0, 1024);
 			goto RESTART_SELECT;
-		} elsif ($rout =~ /^knul ([^\s]+) /) {
+		} elsif ($rout =~ /^kn ([^\s]+) /) {
 			my $key = $1;
 			my $module;
 			sysread(STDIN, $module, 1024);
@@ -3348,7 +3348,7 @@ RESTART_SELECT:
 				if ($verbose);
 			$master_store->{$module}->{$key} = undef;
 			goto RESTART_SELECT;
-		} elsif ($rout =~ /^kout ([^\s]+) /) {
+		} elsif ($rout =~ /^ko ([^\s]+) /) {
 			my $key = $1;
 			my $value;
 			my $module;
@@ -3551,6 +3551,7 @@ sub refresh {
 	my $my_json_ref = undef;
 	my $i;
 	my @streams = ();
+	my $dont_roll_back_too_far = 0;
 
 	# this mixes all the tweet streams (timeline, hashtags, replies
 	# and lists) into a single unified data river.
@@ -3610,7 +3611,7 @@ sub refresh {
 		my $l = &max((($last_id) ? 100 :
 			$fetchwanted || $backload), $searchhits);
 		# temporarily squelch server complaints (see below)
-		$muffle_server_messages = 1;
+		$muffle_server_messages = 1 unless ($verbose);
 		foreach $k (@trackstrings) {
 		$r = &grabjson("$queryurl?${k}&rpp=${l}&result_type=recent",
 				$fetch_id, 1, 0, {
@@ -3628,6 +3629,7 @@ sub refresh {
 					"type" => "search",
 					"payload" => $k
 				});
+				$dont_roll_back_too_far = 1;
 			}
 		# or maybe not even then?
 			if (!defined($r) || ref($r) ne 'ARRAY') {
@@ -3638,6 +3640,7 @@ sub refresh {
 					"type" => "search",
 					"payload" => $k
 				});
+				$dont_roll_back_too_far = 1;
 			}
 			push(@streams, $r)
 				if (defined($r) &&
@@ -3681,6 +3684,8 @@ sub refresh {
 		foreach $n (@streams) {
 			SMIX0: foreach $j (@{ $n }) {
 				my $id = $j->{'id_str'}; # for ease of use
+				# possible to happen if search tryhard is on
+				next SMIX0 if ($id < $fetch_id);
 
 				# filter this lot against the id cache
 				# and any tweets we just filtered.
@@ -3732,8 +3737,10 @@ sub refresh {
 		'';
 	# try to widen the window to a "reasonable amount"
 	$fetch_id = ($fetch_id == 0) ? $last_id :
-		(length($new_fi) && $new_fi ne $last_id) ? $new_fi :
-		($relative_last_id > 0 && $relative_last_id ne $last_id) ?
+		(length($new_fi) && $new_fi ne $last_id
+			&& $new_fi > $fetch_id) ? $new_fi :
+		($relative_last_id > 0 && $relative_last_id ne $last_id &&
+				$relative_last_id > $fetch_id) ?
 			$relative_last_id : $fetch_id;
 	
 	print $stdout
@@ -4886,7 +4893,7 @@ sub getbackgroundkey {
 	my $key = shift;
 	my $l;
 	my $k;
-	print C substr("kin $key --------------------", 0, 19)."\n";
+	print C substr("ki $key ---------------------", 0, 19)."\n";
 	my $ref = (length($dispatch_ref->[0])) ? ($dispatch_ref->[0]) :
 		"DEFAULT";
 	print C substr(unpack("${pack_magic}H*", $ref).$space_pad, 0, 1024);
@@ -4913,9 +4920,9 @@ sub sendbackgroundkey {
 		return;
 	}
 	if (!length($value)) {
-		print C substr("knul $key --------------------", 0, 19)."\n";
+		print C substr("kn $key ---------------------", 0, 19)."\n";
 	} else {
-		print C substr("kout $key --------------------", 0, 19)."\n";
+		print C substr("ko $key ---------------------", 0, 19)."\n";
 	}
 	my $ref = (length($dispatch_ref->[0])) ? ($dispatch_ref->[0]) :
 		"DEFAULT";
