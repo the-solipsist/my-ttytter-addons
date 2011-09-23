@@ -39,7 +39,7 @@ EOF
 	
 	$command_line = $0; $0 = "TTYtter";
 	$TTYtter_VERSION = "1.2";
-	$TTYtter_PATCH_VERSION = 0;
+	$TTYtter_PATCH_VERSION = 1;
 	$TTYtter_RC_NUMBER = 0; # non-zero for release candidate
 	# this is kludgy, yes.
 	$LANG = $ENV{'LANG'} || $ENV{'GDM_LANG'} || $ENV{'LC_CTYPE'} ||
@@ -935,12 +935,12 @@ direct messages). IF THIS IS NOT CORRECT, PRESS CTRL-C NOW!
 
 4. Click Authorize app.
 
-5. A PIN number will appear. Enter it below.
+5. A PIN will appear. Enter it below.
 
 EOF
 		$j = '';
 		while(!(0+$j)) {
-			print $stdout "Enter PIN number> ";
+			print $stdout "Enter PIN> ";
 			chomp($j = <STDIN>);
 		}
 		print $stdout "\nRequest from $oauthaccurl ...";
@@ -1117,10 +1117,10 @@ direct messages). IF THIS IS NOT CORRECT, PRESS CTRL-C NOW!
 
 3. Click Authorize app.
 
-4. A PIN number will appear. Enter it below.
+4. A PIN will appear. Enter it below.
 
 EOF
-	print $stdout "Enter PIN number> ";
+	print $stdout "Enter PIN> ";
 	chomp($j = <STDIN>);
 	print $stdout "\nRequest from $oauthaccurl ...";
 	($at, $ats) = &tryhardfortoken($oauthaccurl, "oauth_verifier=$j");
@@ -5649,7 +5649,7 @@ sub grabjson {
 
 	# if wrapped in results object, unwrap it (@kellyterryjones)
 	# (and tag it to do more later)
-        if ($data =~ s/^\{['"]results['"]:(\[.*\]).*$/$1/isg) {
+        if ($data =~ s/^(\{.+,|\{)\s*['"]results['"]\s*:\s*(\[.*\]).*$/$2/isg) {
 		$kludge_search_api_adjust = 1;
 	}
 
