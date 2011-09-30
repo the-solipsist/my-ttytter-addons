@@ -8,7 +8,7 @@ test-limit:
 	echo "/limit" | ./bin/ttytter -exts=rate_limit_oauth.pl -ssl -simplestart | egrep "Remaining hits [0-9]{3}"
 #	echo "/limit" | ./bin/beta -exts=rate_limit_oauth.pl -ssl -simplestart | egrep "Remaining hits [0-9]{3}"
 test-later:
-	echo "/later c9 test hudson-test" | ./bin/ttytter -exts=later.pl -ssl -simplestart | grep "Added to delicious.com"
+	echo "/later c9 test hudson-test" | ./bin/ttytter -exts=later.pl -ssl -simplestart | grep "done"
 	curl -s -k -u `cat ~/.delicious` https://api.del.icio.us/v1/posts/delete?url=`cat hudson-ttytter-later-test`
 	rm -f hudson-ttytter-later-test
 #	echo "/later c9 test hudson-test" | ./bin/beta -exts=later.pl -ssl -simplestart | grep "Added to delicious.com"
