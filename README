@@ -8,6 +8,7 @@ The current tools are:
 /fsearch <string>
 /limit
 /later <tweet id> <description>
+/report <tweet id>
 
 and information about them can be found at:
 
