@@ -24,7 +24,7 @@ $addaction = sub {
         }else{ 
             $content = `curl -s -u \"$del_pass\" \"$delicious_url\"`;
         }
-        if ($content =~ m!<result code="done" />!){
+        if ($content =~ m!<result code="done" ?/>!){
             print "Added to delicious.com\n";
             if ($testing == "hudson-test"){
                 `echo "$add_url" > hudson-ttytter-later-test`;
