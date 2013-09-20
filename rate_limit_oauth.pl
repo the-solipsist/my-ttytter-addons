@@ -20,7 +20,7 @@ $addaction = sub {
 
 	if ($command =~ s#^/limit##) {
 		my $result = &grabjson("$rlurl");
-		use Data::Dumper or die("This command needs Data::Dumper to work.");
+		use Data::Dumper;
 		print Dumper(\$result);
 	}
 	return 0;
